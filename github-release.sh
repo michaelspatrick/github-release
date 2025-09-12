@@ -157,7 +157,7 @@ create_repo_if_needed() {
     fi
     info "Creating GitHub repo with gh: $REPO_FULL ($VISIBILITY)"
     # Use --push since we now have a commit; do NOT pass --source to avoid extra prompts
-    gh repo create "$REPO_FULL" --"$VISIBILITY" --disable-issues --disable-wiki --push || \
+    gh repo create "$REPO_FULL" --"$VISIBILITY" --source "." --disable-issues --disable-wiki --push || \
       die "Failed to create repo via gh"
     return 0
   fi

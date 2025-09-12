@@ -1,0 +1,20 @@
+# General
+.DS_Store
+Thumbs.db
+*.log
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# PHP / Composer
+vendor/
+
+# Mac/Linux misc
+*.swp
+*.swo
+.cache/

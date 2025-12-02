@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# github-release.sh (fixed ordering)
+# github-release.sh
 # Initialize (if needed), push, tag, and create a GitHub release for a specified code directory.
-# - Now stages/commits BEFORE attempting to create the GitHub repo (so `gh repo create --push` works).
+# - Stages/commits BEFORE attempting to create the GitHub repo (so `gh repo create` works nicely).
+# - Uses GITHUB_TOKEN or ~/.git-credentials (if present) to avoid interactive username/password prompts.
 
 OWNER=""
 REPO_NAME=""
@@ -89,7 +90,6 @@ cd "$CODE_DIR"
 if [[ ! -d ".git" ]]; then
   info "Initializing git repository in $CODE_DIR"
   git init
-  # Ensure branch
   git checkout -B "$BRANCH"
   # Minimal files
   if [[ ! -f ".gitignore" ]]; then
@@ -109,13 +109,13 @@ GITIGNORE
     info "Created .gitignore"
   fi
   if [[ ! -f "README.md" ]]; then
-    cat > README.md <<EOF
+    cat > README.md <<EOF2
 # ${REPO_NAME}
 
 Initialized by github-release.sh on $(date -Iseconds).
 Default branch: \`${BRANCH}\`
 Visibility: \`${VISIBILITY}\`
-EOF
+EOF2
     info "Created README.md"
   fi
 fi
@@ -123,7 +123,7 @@ fi
 # Ensure branch
 git checkout -B "$BRANCH"
 
-# Stage & commit BEFORE remote/repo creation (important for gh --push)
+# Stage & commit BEFORE remote/repo creation
 git add -A
 if ! git diff --cached --quiet; then
   git commit -m "$COMMIT_MSG"
@@ -131,50 +131,93 @@ else
   info "No staged changes to commit."
 fi
 
-# Remote setup
+# Remote URLs
 REMOTE_URL_SSH="git@github.com:${REPO_FULL}.git"
 REMOTE_URL_HTTPS="https://github.com/${REPO_FULL}.git"
+REMOTE_URL_HTTPS_TOKEN=""
 
-if git remote get-url origin >/dev/null 2>&1; then
-  EXISTING_URL="$(git remote get-url origin)"
-  info "Remote 'origin' already set to $EXISTING_URL"
-else
-  if [[ -f "$HOME/.ssh/id_rsa" || -f "$HOME/.ssh/id_ed25519" ]]; then
-    git remote add "$REMOTE_NAME" "$REMOTE_URL_SSH"
-    info "Added remote '$REMOTE_NAME' -> $REMOTE_URL_SSH"
-  else
-    git remote add "$REMOTE_NAME" "$REMOTE_URL_HTTPS"
-    info "Added remote '$REMOTE_NAME' -> $REMOTE_URL_HTTPS"
+# Prefer GITHUB_TOKEN, fall back to ~/.git-credentials if present
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  GIT_USER="${GITHUB_USER:-x-access-token}"
+  REMOTE_URL_HTTPS_TOKEN="https://${GIT_USER}:${GITHUB_TOKEN}@github.com/${REPO_FULL}.git"
+elif [[ -f "$HOME/.git-credentials" ]]; then
+  # Look for a line like: https://user:token@github.com (no extra path)
+  CRED_LINE_RAW="$(grep -E '^https://[^:]+:[^@]+@github\.com/?$' "$HOME/.git-credentials" | head -n1 || true)"
+  if [[ -n "$CRED_LINE_RAW" ]]; then
+    # Normalize: drop trailing slash if any
+    CRED_BASE="${CRED_LINE_RAW%/}"
+    REMOTE_URL_HTTPS_TOKEN="${CRED_BASE}/${REPO_FULL}.git"
+    info "Using credentials from ~/.git-credentials for GitHub HTTPS."
   fi
 fi
 
-# Create GitHub repo if needed (after initial commit exists)
+# Remote setup / upgrade
+if git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+  EXISTING_URL="$(git remote get-url "$REMOTE_NAME")"
+  info "Remote '$REMOTE_NAME' already set to $EXISTING_URL"
+  # If we have a token/credential-based URL, always normalize/override the remote
+  if [[ -n "$REMOTE_URL_HTTPS_TOKEN" ]]; then
+    git remote set-url "$REMOTE_NAME" "$REMOTE_URL_HTTPS_TOKEN"
+    info "Updated remote '$REMOTE_NAME' to token-authenticated HTTPS URL."
+  fi
+else
+  # No remote yet: decide what to use
+  if [[ -n "$REMOTE_URL_HTTPS_TOKEN" ]]; then
+    git remote add "$REMOTE_NAME" "$REMOTE_URL_HTTPS_TOKEN"
+    info "Added remote '$REMOTE_NAME' -> $REMOTE_URL_HTTPS_TOKEN (HTTPS with token/credentials)"
+  elif [[ -f "$HOME/.ssh/id_rsa" || -f "$HOME/.ssh/id_ed25519" ]]; then
+    git remote add "$REMOTE_NAME" "$REMOTE_URL_SSH"
+    info "Added remote '$REMOTE_NAME' -> $REMOTE_URL_SSH (SSH)"
+  else
+    git remote add "$REMOTE_NAME" "$REMOTE_URL_HTTPS"
+    info "Added remote '$REMOTE_NAME' -> $REMOTE_URL_HTTPS (plain HTTPS – may prompt if repo is private)"
+  fi
+fi
+
 create_repo_if_needed() {
-  if has_cmd gh; then
+  # Prefer gh only if authenticated; otherwise fall back to REST if GITHUB_TOKEN is set
+  if has_cmd gh && gh auth status >/dev/null 2>&1; then
     if gh repo view "$REPO_FULL" >/dev/null 2>&1; then
       info "Remote GitHub repo exists: $REPO_FULL"
       return 0
     fi
     info "Creating GitHub repo with gh: $REPO_FULL ($VISIBILITY)"
-    # Use --push since we now have a commit; do NOT pass --source to avoid extra prompts
     gh repo create "$REPO_FULL" --"$VISIBILITY" --source "." --disable-issues --disable-wiki || \
       die "Failed to create repo via gh"
     return 0
   fi
-  [[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN not set; cannot create repo without gh"
+
+  [[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN not set; cannot create repo without authenticated gh"
+
+  local API_URL="https://api.github.com"
+  # First, check if the repo already exists
+  local CHECK
+  CHECK=$(curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 "$API_URL/repos/${REPO_FULL}" || true)
+  if echo "$CHECK" | grep -q '"full_name"'; then
+    info "Remote GitHub repo already exists: $REPO_FULL"
+    return 0
+  fi
+
   info "Creating GitHub repo via REST API"
-  API_URL="https://api.github.com"
+  local RESP
   RESP=$(curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
                -H "Accept: application/vnd.github+json" \
                "$API_URL/user/repos" \
-               -d "{\"name\":\"$REPO_NAME\",\"private\":$( [[ "$VISIBILITY" == "private" ]] && echo true || echo false )}")
-  echo "$RESP" | grep -q '"full_name"' || { echo "$RESP" >&2; die "Failed to create repo via API"; }
-  info "Created GitHub repo: $REPO_FULL"
+               -d "{\"name\":\"$REPO_NAME\",\"private\":$( [[ \"$VISIBILITY\" == \"private\" ]] && echo true || echo false )}")
+  if echo "$RESP" | grep -q '"full_name"'; then
+    info "Created GitHub repo: $REPO_FULL"
+    return 0
+  fi
+
+  echo "$RESP" >&2
+  die "Failed to create repo via API"
 }
 
 # Try to reach remote; if not, create it
-if ! git ls-remote --exit-code "$REMOTE_NAME" &>/dev/null; then
-  info "Remote repository not reachable; will attempt to create it."
+if ! git ls-remote "$REMOTE_NAME" &>/dev/null; then
+  info "Remote repository not reachable or empty; will attempt to ensure it exists on GitHub."
   create_repo_if_needed
 fi
 
@@ -233,7 +276,7 @@ fi
 
 create_release() {
   local notes="$COMMIT_MSG"
-  if has_cmd gh; then
+  if has_cmd gh && gh auth status >/dev/null 2>&1; then
     if [[ -n "$ZIPFILE" && -f "$ZIPFILE" ]]; then
       gh release create "$VERSION_TAG" ${ZIPFILE:+ "$ZIPFILE"} \
         --repo "$REPO_FULL" --title "$VERSION_TAG" --notes "$notes" || \
@@ -244,15 +287,19 @@ create_release() {
     fi
     return 0
   fi
-  [[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN not set; cannot create release without gh"
-  API_URL="https://api.github.com"
+
+  [[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN not set; cannot create release without authenticated gh"
+  local API_URL="https://api.github.com"
+  local RESP
   RESP=$(curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
                -H "Accept: application/vnd.github+json" \
                "$API_URL/repos/${REPO_FULL}/releases" \
                -d "{\"tag_name\":\"$VERSION_TAG\",\"name\":\"$VERSION_TAG\",\"body\":\"$(printf '%s' "$notes" | sed 's/\"/\\\"/g')\",\"draft\":false,\"prerelease\":false}")
+  local UPLOAD_URL
   UPLOAD_URL=$(echo "$RESP" | grep -oE '"upload_url":\s*"[^"]+' | sed 's/"upload_url":\s*"//; s/{.*$//')
   [[ -n "$UPLOAD_URL" ]] || { echo "$RESP" >&2; die "Failed to create release via API"; }
   if [[ -n "$ZIPFILE" && -f "$ZIPFILE" ]]; then
+    local FILENAME
     FILENAME="$(basename "$ZIPFILE")"
     curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
          -H "Content-Type: application/zip" \
